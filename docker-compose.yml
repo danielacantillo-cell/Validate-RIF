@@ -1,6 +1,4 @@
-version: '3.8'
 services:
-  # --- 1. BASE DE DATOS (Postgres) ---
   db:
     image: postgres:15-alpine
     container_name: n8n_db
@@ -10,14 +8,13 @@ services:
       - POSTGRES_PASSWORD=${SERVER_PASSWORD}
       - POSTGRES_DB=${DB_POSTGRESDB_DATABASE}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_POSTGRESDB_USER} -d ${DB_POSTGRESDB_DATABASE}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # --- 2. REDIS (Para n8n Queue Mode) ---
   redis:
     image: redis:7-alpine
     container_name: n8n_redis
@@ -29,21 +26,14 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- 3. N8N (Automatización) ---
   n8n:
-    image: n8nio/n8n:latest
+    build: 
+      context: .
+      dockerfile: Dockerfile 
     container_name: n8n_app
     restart: always
-    deploy:
-      resources:
-        limits:
-          memory: 4096M
-        reservations:
-          memory: 512M
     ports:
       - "5678:5678"
-    env_file:
-      - .env
     environment:
       - N8N_HOST=${N8N_HOST}
       - N8N_PORT=5678
@@ -51,7 +41,7 @@ services:
       - NODE_ENV=production
       - WEBHOOK_URL=http://${N8N_HOST}:5678/
       - TZ=${TZ}
-      - GENERIC_TIMEZONE=${TZ}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=db
       - DB_POSTGRESDB_PORT=5432
@@ -61,37 +51,30 @@ services:
       - QUEUE_BULL_REDIS_HOST=redis
       - QUEUE_BULL_REDIS_PORT=6379
       - QUEUE_BULL_REDIS_PASSWORD=${SERVER_PASSWORD}
+      - NODE_FUNCTION_ALLOW_EXTERNAL=${NODE_FUNCTION_ALLOW_EXTERNAL}
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
-      - n8n_data:/home/node/.n8n
+      - ./n8n_data:/home/node/.n8n
 
-  # --- 4. FASTAPI (API de RIF con Batch Worker) ---
   fastapi-app:
     build:
       context: .
       dockerfile: Dockerfile.fastapi
     container_name: fastapi_app
     restart: always
-    env_file:
-      - .env
-    environment:
-      # IMPORTANTE: Sobrescribimos DB_HOST para que la API busque a "db" dentro de la red de Docker
-      - DB_HOST=db
-      - DB_POSTGRESDB_USER=${DB_POSTGRESDB_USER}
-      - SERVER_PASSWORD=${SERVER_PASSWORD}
-      - DB_POSTGRESDB_DATABASE=${DB_POSTGRESDB_DATABASE}
-      - MAX_CONCURRENCY=${MAX_CONCURRENCY}
-      - FASTAPI_API_KEY=${FASTAPI_API_KEY}
     ports:
       - "8000:8000"
+    environment:
+      - DB_HOST=db
+      - DB_USER=${DB_POSTGRESDB_USER}
+      - DB_PASSWORD=${SERVER_PASSWORD}
+      - DB_NAME=${DB_POSTGRESDB_DATABASE}
+      - FASTAPI_API_KEY=${FASTAPI_API_KEY}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
     depends_on:
       db:
         condition: service_healthy
-
-volumes:
-  postgres_data:
-  n8n_data:
