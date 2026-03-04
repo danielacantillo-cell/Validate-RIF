@@ -45,13 +45,19 @@ async def endpoint_validar(
     
     resultados = []
     for item in payload.items:
+        # Ejecuta la validación usando la lógica real de RifMathService
         res = math_service.procesar_item_completo(item.rif, item.global_id)
+        
+        # Determinamos validez basándonos en si el "después" tiene errores
+        es_valido = (res.get("TIPO_DE_ERROR_DESPUES") == "", )
+        
         resultados.append({
             "RIF_ORIGINAL": item.rif,
             "ID_CLIENTE": item.global_id,
-            "ESTADO": "VÁLIDO" if res["valido"] else "INVÁLIDO",
-            "RIF_CORREGIDO": res["rif_normalizado"],
-            "DV_ESPERADO": res["dv_esperado"]
+            "ESTADO": "VÁLIDO" if es_valido else "INVÁLIDO",
+            "RIF_CORREGIDO": res.get("RIF_CORREGIDO"),
+            "ERROR_ANTES": res.get("TIPO_DE_ERROR_ANTES"),
+            "ERROR_DESPUES": res.get("TIPO_DE_ERROR_DESPUES")
         })
 
     df = pd.DataFrame(resultados)
@@ -66,7 +72,7 @@ async def endpoint_validar(
         headers={"Content-Disposition": f"attachment; filename=auditoria_rif_{datetime.now().strftime('%Y%m%d')}.xlsx"}
     )
 
-# 2. PROCESO DE EXTRACCIÓN (Asíncrono - Persistencia Inicial)
+# 2. PROCESO DE EXTRACCIÓN (Asíncrono)
 @router.post(
     "/extraer",
     response_model=BatchResponse,
@@ -80,8 +86,7 @@ async def endpoint_extraer(
 ):
     id_lote = uuid.uuid4()
     
-    # Persistencia Inicial
-    # Guardamos el lote y sus items en la DB antes de responderle al cliente (n8n)
+    # Persistencia Inicial en DB
     await db_service.crear_lote_inicial(
         id_lote=id_lote, 
         items=payload.items, 
@@ -99,13 +104,9 @@ async def endpoint_extraer(
         "mensaje": "Lote recibido y guardado. Procesando en segundo plano."
     }
 
-# 3. PROCESO DE CONSULTA (Métricas en tiempo real)
-@router.get(
-    "/consultar/{id_lote}",
-    summary="Consulta estatus y progreso del lote"
-)
+# 3. PROCESO DE CONSULTA (Métricas)
+@router.get("/consultar/{id_lote}", summary="Consulta estatus y progreso del lote")
 async def endpoint_consultar(id_lote: str, token: str = Depends(validate_api_key)):
-    # Métricas visibles desde DB
     try:
         uuid_lote = uuid.UUID(id_lote)
         status_data = await db_service.obtener_estatus_lote(uuid_lote)
@@ -118,36 +119,24 @@ async def endpoint_consultar(id_lote: str, token: str = Depends(validate_api_key
         raise HTTPException(status_code=400, detail="ID de lote inválido")
 
 # 4. REPORTE DE FALLIDOS 
-@router.get(
-    "/consultar/{id_lote}/fallidos",
-    summary="Reporte de registros con error"
-)
+@router.get("/consultar/{id_lote}/fallidos", summary="Reporte de registros con error")
 async def endpoint_reporte_fallidos(id_lote: str, token: str = Depends(validate_api_key)):
-    """Devuelve la lista de RIFs que no pudieron ser procesados."""
     try:
         uuid_lote = uuid.UUID(id_lote)
         fallidos = await db_service.obtener_reporte_fallidos(uuid_lote)
-        return {
-            "id_lote": id_lote,
-            "total_fallidos": len(fallidos),
-            "items": fallidos
-        }
+        return {"id_lote": id_lote, "total_fallidos": len(fallidos), "items": fallidos}
     except ValueError:
         raise HTTPException(status_code=400, detail="ID de lote inválido")
 
 
+# --- MOTOR DE EJECUCIÓN (CONCURRENCIA CONTROLADA) ---
 
-# MOTOR DE EJECUCIÓN CON CONCURRENCIA CONTROLADA
 async def procesar_un_rif(item, id_lote: uuid.UUID, semaforo: asyncio.Semaphore):
-    """Lógica individual de cada RIF con guardado incremental."""
-    async with semaforo:  # Control de concurrencia
+    async with semaforo:
         try:
             logger.info(f"🔎 Consultando SENIAT: {item.rif}")
-            
-            # Llamada al scraper
             resultado = await seniat_service.consultar_rif(item.rif)
             
-            # Guardado Incremental (Éxito o Captcha Fallido)
             if resultado.get("error_interno"):
                 await db_service.actualizar_item_rif(
                     id_lote, item.rif, "ERROR", error_msg=resultado["error_interno"]
@@ -156,25 +145,15 @@ async def procesar_un_rif(item, id_lote: uuid.UUID, semaforo: asyncio.Semaphore)
                 await db_service.actualizar_item_rif(
                     id_lote, item.rif, "COMPLETADO", datos=resultado
                 )
-                
         except Exception as e:
             logger.error(f"❌ Fallo crítico en item {item.rif}: {str(e)}")
-            #  Guardado Incremental (Fallo inesperado)
             await db_service.actualizar_item_rif(
                 id_lote, item.rif, "ERROR", error_msg=str(e)
             )
 
 async def motor_procesamiento_fondo(id_lote: uuid.UUID, items: List):
-    """Gestiona el lote de forma concurrente."""
-    # El semáforo limita cuántos requests simultáneos hacemos
     semaforo = asyncio.Semaphore(settings.MAX_CONCURRENCY)
-    
-    # Creamos la lista de tareas concurrentes
     tareas = [procesar_un_rif(item, id_lote, semaforo) for item in items]
-    
-    # Ejecutamos todo (await masivo)
     await asyncio.gather(*tareas)
-    
-    # Al terminar todas, marcamos el lote como finalizado
     await db_service.finalizar_lote(id_lote)
     logger.info(f"🏁 Finalizado procesamiento del Lote: {id_lote}")
